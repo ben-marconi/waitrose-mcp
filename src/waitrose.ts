@@ -160,6 +160,7 @@ export interface TrolleyItem {
   totalPrice: Price;
   canSubstitute: boolean;
   noteToShopper: string | null;
+  personalisedMessage?: string | null;
 }
 
 export interface TrolleyTotals {
@@ -531,7 +532,6 @@ export class WaitroseClient {
   private accessToken: string | null = null;
   private refreshToken: string | null = null;
   private customerId: string | null = null;
-  private customerOrderId: string | null = null;
   private defaultBranchId: string | null = null;
 
   /** Execute a GraphQL query/mutation */
@@ -640,7 +640,6 @@ export class WaitroseClient {
     this.accessToken = session.accessToken;
     this.refreshToken = session.refreshToken;
     this.customerId = session.customerId;
-    this.customerOrderId = session.customerOrderId;
     this.defaultBranchId = session.defaultBranchId;
 
     return session;
@@ -666,12 +665,7 @@ export class WaitroseClient {
     this.accessToken = null;
     this.refreshToken = null;
     this.customerId = null;
-    this.customerOrderId = null;
-  }
-
-  /** Get the current order ID */
-  getOrderId(): string | null {
-    return this.customerOrderId;
+    this.defaultBranchId = null;
   }
 
   /** Get the current customer ID */
@@ -685,19 +679,13 @@ export class WaitroseClient {
 
   /** Get the current shopping context */
   async getShoppingContext(): Promise<ShoppingContext> {
-    const context = await this.readShoppingContext();
-    this.customerOrderId = context.customerOrderId;
-    this.defaultBranchId = context.defaultBranchId;
-    return context;
-  }
-
-  private async readShoppingContext(): Promise<ShoppingContext> {
     const result = await this.graphql<{ data: { shoppingContext: ShoppingContext } }>(QUERIES.GetShoppingContext);
     return result.data.shoppingContext;
   }
 
   private async currentOrderId() {
-    return this.customerOrderId || (await this.getShoppingContext()).customerOrderId;
+    // The active order can change outside this client. Resolve it for each operation.
+    return (await this.getShoppingContext()).customerOrderId;
   }
 
   // ==========================================================================
@@ -739,7 +727,7 @@ export class WaitroseClient {
   /** Review the current order using fresh context, eligibility, totals and slot. */
   async getCheckout(): Promise<CheckoutReview> {
     if (!this.accessToken) throw new Error("Login is required for checkout");
-    const context = await this.readShoppingContext();
+    const context = await this.getShoppingContext();
     const orderId = context.customerOrderId;
     if (!orderId) throw new CheckoutPreflightError("There is no active Waitrose order to review.");
     const [trolley, slot] = await Promise.all([this.getTrolley(orderId), this.getCurrentSlot(undefined, orderId)]);
@@ -792,9 +780,6 @@ export class WaitroseClient {
       });
     } catch {
       throw new CheckoutOutcomeUnknownError(options.orderId);
-    } finally {
-      // A subsequent trolley operation must resolve the active order again.
-      this.customerOrderId = null;
     }
     if (!response.ok) {
       if (response.status >= 500 || response.status === 408) throw new CheckoutOutcomeUnknownError(options.orderId);
@@ -832,7 +817,7 @@ export class WaitroseClient {
 
   /** Empty the entire trolley */
   async emptyTrolley(orderId?: string): Promise<TrolleyResponse> {
-    const id = orderId || this.customerOrderId;
+    const id = orderId || await this.currentOrderId();
     if (!id) throw new Error("No order ID available");
 
     const result = await this.graphql<{ data: { emptyTrolley: TrolleyResponse } }>(
@@ -962,6 +947,7 @@ export class WaitroseClient {
 
   /** Get available slot dates */
   async getSlotDates(slotType: SlotType, branchId?: string, addressId?: string): Promise<SlotDate[]> {
+    const context = await this.getShoppingContext();
     const result = await this.graphql<{ 
       data: { 
         slotDates: { 
@@ -972,8 +958,8 @@ export class WaitroseClient {
     }>(QUERIES.SlotDates, {
       slotDatesInput: {
         slotType,
-        branchId: branchId || this.defaultBranchId,
-        customerOrderId: this.customerOrderId,
+        branchId: branchId || context.defaultBranchId,
+        customerOrderId: context.customerOrderId,
         addressId,
       },
     });
@@ -987,7 +973,7 @@ export class WaitroseClient {
 
   /** Get available slots for specific days */
   async getSlotDays(slotType: SlotType, fromDate: string, branchId?: string, addressId?: string): Promise<SlotDay[]> {
-    const customerOrderId = await this.currentOrderId();
+    const context = await this.getShoppingContext();
     const result = await this.graphql<{ 
       data: { 
         slotDays: { 
@@ -998,8 +984,8 @@ export class WaitroseClient {
     }>(QUERIES.SlotDays, {
       slotDaysInput: {
         slotType,
-        branchId: branchId || this.defaultBranchId,
-        customerOrderId,
+        branchId: branchId || context.defaultBranchId,
+        customerOrderId: context.customerOrderId,
         addressId,
         fromDate,
       },

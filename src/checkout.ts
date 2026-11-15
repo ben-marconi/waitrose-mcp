@@ -10,7 +10,7 @@ function checkoutDetails(review: CheckoutReview) {
   const productNames = new Map(products.map(({ lineNumber, name }) => [lineNumber, name]));
   const items = [...trolley.trolleyItems]
     .sort((a, b) => a.lineNumber.localeCompare(b.lineNumber) || a.trolleyItemId - b.trolleyItemId)
-    .map(({ trolleyItemId, lineNumber, quantity, totalPrice, canSubstitute, noteToShopper }) => ({
+    .map(({ trolleyItemId, lineNumber, quantity, totalPrice, canSubstitute, noteToShopper, personalisedMessage }) => ({
       trolleyItemId,
       lineNumber,
       name: productNames.get(lineNumber),
@@ -18,6 +18,7 @@ function checkoutDetails(review: CheckoutReview) {
       totalPrice: totalPrice && { amount: totalPrice.amount, currencyCode: totalPrice.currencyCode },
       canSubstitute,
       noteToShopper,
+      personalisedMessage: personalisedMessage ?? null,
     }));
 
   return {
