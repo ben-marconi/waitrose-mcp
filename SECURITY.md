@@ -1,7 +1,8 @@
 # Security policy
 
 This is an unofficial, personal-project MCP server that can hold Waitrose
-account credentials and (when enabled) change a real shopping trolley.
+account credentials and, when enabled, place orders using the account's
+existing payment setup. Give write access only to trusted MCP clients.
 
 - Never commit credentials, session tokens, or `.env` files. Report any you
   find in history as a security issue.
