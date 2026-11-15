@@ -8,6 +8,7 @@
  *                                        ALLOW_INSECURE_NO_AUTH=1 (localhost-only use)
  *   WAITROSE_ENABLE_WRITES=true        - register trolley write tools (default: read-only)
  *   WAITROSE_ENABLE_SLOT_BOOKING=true  - register slot booking when writes are enabled
+ *   WAITROSE_ENABLE_CHECKOUT=true      - register order placement when writes are enabled
  *   PORT                               - listen port (default 3000)
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -15,18 +16,21 @@ import { timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import WaitroseClient from "./waitrose.js";
-import { activeTools, type ToolContext } from "./tools.js";
+import WaitroseClient, { CheckoutPreflightError } from "./waitrose.js";
+import { Checkout, CheckoutToolError } from "./checkout.js";
+import { activeTools, checkoutEnabled, slotBookingEnabled, writesEnabled, type ToolContext } from "./tools.js";
 
 const SERVER_INSTRUCTIONS =
-  "Waitrose grocery tools. Typical sequence: waitrose_search to find products and line numbers, then (when writes are enabled and the user has confirmed the exact items) waitrose_add_to_trolley. Check waitrose_list_slot_days / waitrose_get_current_slot for delivery timing. Never place orders: final checkout is manual in the Waitrose app. Waitrose slot bookings and trolley changes affect the user's real account; always confirm details with the user before write tools.";
+  "Waitrose grocery tools. Always confirm details with the user before write tools. For checkout, use waitrose_get_checkout, show the items, estimated total and slot to the user, and obtain their explicit confirmation before calling waitrose_place_order with that review ID. Placement can charge the user's existing payment method. If placement is uncertain, check the order in Waitrose before taking any other action.";
 
 class LoginError extends Error {}
+class WriteInProgressError extends Error {}
 
 export function createContext(): ToolContext {
   const client = new WaitroseClient();
   let loggedIn = false;
   let loggingIn: Promise<void> | null = null;
+  let writing = false;
 
   const doLogin = async () => {
     const email = process.env.WAITROSE_EMAIL;
@@ -47,6 +51,7 @@ export function createContext(): ToolContext {
 
   return {
     client,
+    checkout: new Checkout(client),
     ensureLoggedIn: async () => {
       if (loggedIn) return;
       if (!loggingIn) {
@@ -55,6 +60,15 @@ export function createContext(): ToolContext {
         });
       }
       await loggingIn;
+    },
+    runWrite: async (action) => {
+      if (writing) throw new WriteInProgressError("A Waitrose change is already in progress. Wait for its result before making another change.");
+      writing = true;
+      try {
+        return await action();
+      } finally {
+        writing = false;
+      }
     },
   };
 }
@@ -76,10 +90,11 @@ export function buildMcpServer(ctx: ToolContext): McpServer {
       },
       async (args) => {
         try {
-          return (await tool.handler(ctx, args)) as any;
+          const run = () => tool.handler(ctx, args);
+          return (await (tool.annotations.readOnlyHint ? run() : ctx.runWrite(run))) as any;
         } catch (err) {
           // Upstream exceptions can contain entire response bodies, including account data.
-          const message = err instanceof LoginError ? err.message
+          const message = err instanceof LoginError || err instanceof CheckoutPreflightError || err instanceof CheckoutToolError || err instanceof WriteInProgressError ? err.message
             : tool.annotations.readOnlyHint
               ? "Waitrose could not complete this request. If the session expired, restart the server to sign in again."
               : "Waitrose could not confirm this change. Check the Waitrose app before trying again.";
@@ -119,7 +134,7 @@ export function startHttp(port = Number(process.env.PORT ?? 3000)) {
     const path = req.url?.split("?", 1)[0];
     if (path === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, writes: process.env.WAITROSE_ENABLE_WRITES === "true", slotBooking: process.env.WAITROSE_ENABLE_SLOT_BOOKING === "true" && process.env.WAITROSE_ENABLE_WRITES === "true" }));
+      res.end(JSON.stringify({ ok: true, writes: writesEnabled(), slotBooking: slotBookingEnabled(), checkout: checkoutEnabled() }));
       return;
     }
     if (path !== "/mcp") {
@@ -160,10 +175,8 @@ export function startHttp(port = Number(process.env.PORT ?? 3000)) {
     await transport.handleRequest(req, res);
   });
   httpServer.listen(port, host, () => {
-    const writes = process.env.WAITROSE_ENABLE_WRITES === "true";
-    const slots = writes && process.env.WAITROSE_ENABLE_SLOT_BOOKING === "true";
     console.log(
-      `waitrose-mcp listening on ${host === "::1" ? "[::1]" : host}:${(httpServer.address() as { port: number }).port} /mcp (read tools: 8, trolley write tools: ${writes ? "3 ENABLED" : "disabled"}, slot booking: ${slots ? "ENABLED" : "disabled"})`
+      `waitrose-mcp listening on ${host === "::1" ? "[::1]" : host}:${(httpServer.address() as { port: number }).port} /mcp (writes: ${writesEnabled()}, slot booking: ${slotBookingEnabled()}, checkout: ${checkoutEnabled()})`
     );
   });
   return httpServer;

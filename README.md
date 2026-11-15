@@ -7,10 +7,9 @@ Waitrose mobile app API through the vendored
 client ([MIT license](LICENSE-UPSTREAM-waitrose)). This project is not
 affiliated with or endorsed by Waitrose.
 
-**Checkout stays in Waitrose.** The MCP server exposes no tools for placing,
-paying for, cancelling, or starting an amendment of an order. Trolley and
-slot writes, when enabled, can affect the account's active trolley or an
-order already being amended in Waitrose.
+Checkout review is available in read-only mode. Placing a real order is a
+separate opt-in and uses Waitrose's existing payment setup. Manage order
+cancellations and amendments in Waitrose.
 
 ## Terms of use
 
@@ -28,6 +27,7 @@ Read tools are always available.
 | `waitrose_browse` | Browse categories (start at `10051` for Groceries) |
 | `waitrose_product_details` | View product details, including ingredients and nutrition where available |
 | `waitrose_get_trolley` | View the current trolley, totals and conflicts |
+| `waitrose_get_checkout` | Review items, estimated total, delivery or collection slot and checkout blockers |
 | `waitrose_list_orders` / `waitrose_get_order` | View pending and past orders |
 | `waitrose_get_current_slot` | View the booked delivery or collection slot |
 | `waitrose_list_slot_days` | List available slots and charges |
@@ -43,6 +43,23 @@ returned an error.
 | `waitrose_update_trolley_item` | `WAITROSE_ENABLE_WRITES=true` | Changes quantities; zero removes the item |
 | `waitrose_remove_from_trolley` | `WAITROSE_ENABLE_WRITES=true` | Removes an item |
 | `waitrose_book_slot` | Both write and slot booking flags | Reserves a slot; delivery charges may apply |
+| `waitrose_place_order` | Both write and checkout flags | Places the reviewed order and can charge the account's existing payment method |
+
+### Checkout
+
+Run `waitrose_get_checkout` and confirm the items, estimated total and slot.
+When placement is enabled and Waitrose reports that instant checkout is
+available, the review includes an ID valid for five minutes. Call
+`waitrose_place_order` with that ID after explicit confirmation. A newer
+review replaces the ID. The server checks the order, items, slot and total
+again before submitting. Waitrose can still change the final total after
+submission, for example for weighed items or substitutions.
+
+The server submits each order at most once per running process. If the outcome
+is uncertain, check `waitrose_get_order` or the Waitrose app. Check there before
+trying again after a restart, which clears the server's attempt history.
+Client confirmation prompts depend on the MCP client, so enable placement only
+for a client you trust to obtain approval before calling it.
 
 ## Setup
 
@@ -56,7 +73,7 @@ cp .env.example .env
 ```
 
 Edit the ignored `.env` file with your Waitrose login and a random bearer token
-(for example, generate one with `openssl rand -hex 32`). Start with both write
+(for example, generate one with `openssl rand -hex 32`). Start with all write
 flags off.
 
 ```bash
@@ -74,6 +91,7 @@ reports only server status and whether write flags are enabled.
 | `MCP_AUTH_TOKEN` | Required unless the loopback only mode below is enabled. |
 | `WAITROSE_ENABLE_WRITES` | Set to `true` to enable trolley writes. |
 | `WAITROSE_ENABLE_SLOT_BOOKING` | Set to `true` alongside writes to enable booking. Leave off until you intend to reserve a real slot. |
+| `WAITROSE_ENABLE_CHECKOUT` | Set to `true` alongside writes to enable order placement. |
 | `HOST` / `PORT` | Defaults: `127.0.0.1` and `3000`. |
 | `ALLOW_INSECURE_NO_AUTH` | Set to `1` and remove the bearer token only when a trusted tunnel or proxy handles access. Requires a loopback host (`127.0.0.1` or `::1`). Other processes on the machine can still access the listener. |
 
@@ -95,16 +113,16 @@ listener directly: even read tools return private account data.
 
 Run `npm test` after `npm ci --ignore-scripts`. The suite drives the MCP server
 over local HTTP with a mocked Waitrose API. It checks authentication, write
-gates, login, search, trolley reads and writes, and slot listing and booking.
+gates, login, search, trolley reads and writes, slot booking and checkout.
 CI runs it on Node.js 22 and 24.
 
-Live Waitrose compatibility has not been verified. Start with both write flags
+Live Waitrose compatibility has not been verified. Start with all write flags
 off and compare results from `waitrose_search`, `waitrose_get_trolley`, and
-`waitrose_list_slot_days` with the Waitrose app. For a separate trolley write
+`waitrose_get_checkout` with the Waitrose app. For a separate trolley write
 check, use a product that is not already in the trolley and only test when no
 order is being amended. Add one, verify it in Waitrose, then remove it and
-verify the trolley returned to its starting state. Booking a slot is not a
-routine smoke test.
+verify the trolley returned to its starting state. The automated suite mocks
+slot booking and order placement.
 
 ## Files
 

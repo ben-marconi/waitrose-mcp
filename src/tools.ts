@@ -6,18 +6,19 @@
  * only when the corresponding gates are enabled. Their annotations let
  * clients distinguish writes from reads and apply confirmation policies.
  *
- * Deliberately NOT exposed: placeOrder/checkout, cancelOrder,
- * initiateAmendOrder/cancelAmendOrder, emptyTrolley. Final checkout and
- * order cancellation stay manual in the Waitrose app/site.
+ * Cancellation, amendment and emptying the entire trolley stay in Waitrose.
  */
 import { z } from "zod";
 import WaitroseClient from "./waitrose.js";
 import type { SlotType, TrolleyResponse } from "./waitrose.js";
+import type { Checkout } from "./checkout.js";
 
 export interface ToolContext {
   client: WaitroseClient;
+  checkout: Checkout;
   /** Lazily logs in with env credentials on first API call. */
   ensureLoggedIn: () => Promise<void>;
+  runWrite: <T>(action: () => Promise<T>) => Promise<T>;
 }
 
 export interface ToolDef {
@@ -48,6 +49,10 @@ export function writesEnabled(): boolean {
  */
 export function slotBookingEnabled(): boolean {
   return writesEnabled() && process.env.WAITROSE_ENABLE_SLOT_BOOKING === "true";
+}
+
+export function checkoutEnabled(): boolean {
+  return writesEnabled() && process.env.WAITROSE_ENABLE_CHECKOUT === "true";
 }
 
 function json(data: unknown) {
@@ -81,6 +86,18 @@ const WRITE_ANNOTATIONS = (title: string, destructive: boolean) => ({
 });
 
 const READ_TOOLS: ToolDef[] = [
+  {
+    name: "waitrose_get_checkout",
+    title: "Review Waitrose checkout",
+    description:
+      "Review the current trolley, estimated total and delivery or collection slot. Shows any checkout blockers. If placement is enabled and the order is eligible, returns a short-lived review ID. Show the user the items, estimated total and slot before asking them to confirm placement.",
+    schema: {},
+    annotations: { ...READ_ANNOTATIONS("Review Waitrose checkout"), idempotentHint: false },
+    handler: async (ctx) => {
+      await ctx.ensureLoggedIn();
+      return json(await ctx.checkout.getReview(checkoutEnabled()));
+    },
+  },
   {
     name: "waitrose_search",
     title: "Search Waitrose products",
@@ -294,24 +311,26 @@ const SLOT_BOOKING_TOOLS: ToolDef[] = [
   },
 ];
 
-/** Tools the MCP server must never expose, listed for tests and docs. */
-export const DELIBERATELY_EXCLUDED = [
-  "placeOrder",
-  "getCheckout",
-  "cancelOrder",
-  "initiateAmendOrder",
-  "cancelAmendOrder",
-  "emptyTrolley",
-];
+const CHECKOUT_TOOL: ToolDef = {
+  name: "waitrose_place_order",
+  title: "Place Waitrose order",
+  description:
+    "Places a real order using the account's existing payment setup and can charge the user. Call only after the user explicitly confirms the items, estimated total and slot from waitrose_get_checkout. Use that review ID, once. If placement is uncertain, check the order in Waitrose before taking any other action.",
+  schema: {
+    reviewId: z.uuid().describe("The review ID from the checkout summary the user just confirmed"),
+  },
+  annotations: WRITE_ANNOTATIONS("Place Waitrose order", true),
+  handler: async (ctx, args: { reviewId: string }) => {
+    await ctx.ensureLoggedIn();
+    return json({ placed: await ctx.checkout.place(args.reviewId) });
+  },
+};
 
-/** The tool set to register, honouring the write and slot-booking gates. */
+/** The tool set to register, honouring the write gates. */
 export function activeTools(): ToolDef[] {
   const tools = [...READ_TOOLS];
   if (writesEnabled()) tools.push(...WRITE_TOOLS);
   if (slotBookingEnabled()) tools.push(...SLOT_BOOKING_TOOLS);
+  if (checkoutEnabled()) tools.push(CHECKOUT_TOOL);
   return tools;
-}
-
-export function allToolNames(): string[] {
-  return [...READ_TOOLS, ...WRITE_TOOLS, ...SLOT_BOOKING_TOOLS].map((t) => t.name);
 }

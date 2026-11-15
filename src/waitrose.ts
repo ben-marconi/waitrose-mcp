@@ -221,6 +221,8 @@ export class CheckoutOutcomeUnknownError extends Error {
   }
 }
 
+export class CheckoutPreflightError extends Error {}
+
 export interface OrderSlot {
   branchId: string;
   branchName: string;
@@ -683,10 +685,19 @@ export class WaitroseClient {
 
   /** Get the current shopping context */
   async getShoppingContext(): Promise<ShoppingContext> {
+    const context = await this.readShoppingContext();
+    this.customerOrderId = context.customerOrderId;
+    this.defaultBranchId = context.defaultBranchId;
+    return context;
+  }
+
+  private async readShoppingContext(): Promise<ShoppingContext> {
     const result = await this.graphql<{ data: { shoppingContext: ShoppingContext } }>(QUERIES.GetShoppingContext);
-    this.customerOrderId = result.data.shoppingContext.customerOrderId;
-    this.defaultBranchId = result.data.shoppingContext.defaultBranchId;
     return result.data.shoppingContext;
+  }
+
+  private async currentOrderId() {
+    return this.customerOrderId || (await this.getShoppingContext()).customerOrderId;
   }
 
   // ==========================================================================
@@ -714,7 +725,7 @@ export class WaitroseClient {
 
   /** Get the current trolley contents */
   async getTrolley(orderId?: string): Promise<TrolleyResponse> {
-    const id = orderId || this.customerOrderId;
+    const id = orderId || await this.currentOrderId();
     if (!id) throw new Error("No order ID available");
 
     const result = await this.graphql<{ data: { getTrolley: TrolleyResponse } }>(
@@ -728,11 +739,13 @@ export class WaitroseClient {
   /** Review the current order using fresh context, eligibility, totals and slot. */
   async getCheckout(): Promise<CheckoutReview> {
     if (!this.accessToken) throw new Error("Login is required for checkout");
-    const context = await this.getShoppingContext();
+    const context = await this.readShoppingContext();
     const orderId = context.customerOrderId;
-    if (!orderId) throw new Error("No current order available for checkout");
-    const [trolley, slot] = await Promise.all([this.getTrolley(orderId), this.getCurrentSlot()]);
+    if (!orderId) throw new CheckoutPreflightError("There is no active Waitrose order to review.");
+    const [trolley, slot] = await Promise.all([this.getTrolley(orderId), this.getCurrentSlot(undefined, orderId)]);
+    if (!trolley?.trolley) throw new CheckoutPreflightError("Waitrose did not return a trolley for the active order.");
     const blockers: string[] = [];
+    if (trolley.trolley.amendingOrder) blockers.push("Finish amending the existing order in Waitrose before placing a new one");
     if (trolley.trolley.orderId !== orderId) blockers.push("The trolley does not match the current order");
     if (trolley.failures?.length) blockers.push("Waitrose reported trolley failures");
     if (trolley.instantCheckout !== "ALLOWED") blockers.push(`Instant checkout is ${trolley.instantCheckout ?? "unknown"}; complete payment setup or checkout on the Waitrose website`);
@@ -753,16 +766,21 @@ export class WaitroseClient {
    * Uses the account's existing payment setup. Never retries the placement POST.
    * Totals are estimates; the provider can change them after this preflight.
    */
-  async placeOrder(options: { orderId: string; expectedTotal: Price }): Promise<PlacedOrder> {
+  async placeOrder(options: {
+    orderId: string;
+    expectedTotal: Price;
+    beforePlacement?: (review: CheckoutReview) => void;
+  }): Promise<PlacedOrder> {
     if (!/^[A-Za-z0-9_-]+$/.test(options.orderId) || !Number.isFinite(options.expectedTotal?.amount) || options.expectedTotal.amount < 0 || !options.expectedTotal.currencyCode) {
-      throw new Error("A reviewed order ID and expected total/currency are required");
+      throw new CheckoutPreflightError("A reviewed order ID and expected total/currency are required");
     }
     const review = await this.getCheckout();
-    if (review.orderId !== options.orderId) throw new Error("The current order has changed; review checkout again");
-    if (!review.canPlaceOrder) throw new Error(`Checkout blocked: ${review.blockers.join("; ")}`);
+    if (review.orderId !== options.orderId) throw new CheckoutPreflightError("The current order changed. Review checkout again.");
+    if (!review.canPlaceOrder) throw new CheckoutPreflightError("Waitrose no longer considers this order eligible. Review checkout again.");
     if (review.estimatedTotal.amount !== options.expectedTotal.amount || review.estimatedTotal.currencyCode !== options.expectedTotal.currencyCode) {
-      throw new Error("The estimated total has changed; review checkout again");
+      throw new CheckoutPreflightError("The estimated total changed. Review checkout again.");
     }
+    options.beforePlacement?.(review);
     let response: Response;
     try {
       response = await fetch(`https://www.waitrose.com/api/order-orchestration-prod/v1/orders/${encodeURIComponent(options.orderId)}/place`, {
@@ -774,6 +792,9 @@ export class WaitroseClient {
       });
     } catch {
       throw new CheckoutOutcomeUnknownError(options.orderId);
+    } finally {
+      // A subsequent trolley operation must resolve the active order again.
+      this.customerOrderId = null;
     }
     if (!response.ok) {
       if (response.status >= 500 || response.status === 408) throw new CheckoutOutcomeUnknownError(options.orderId);
@@ -788,7 +809,7 @@ export class WaitroseClient {
 
   /** Add or update items in the trolley */
   async updateTrolleyItems(items: TrolleyItemInput[], orderId?: string): Promise<TrolleyResponse> {
-    const id = orderId || this.customerOrderId;
+    const id = orderId || await this.currentOrderId();
     if (!id) throw new Error("No order ID available");
 
     const result = await this.graphql<{ data: { updateTrolleyItems: TrolleyResponse } }>(
@@ -931,10 +952,10 @@ export class WaitroseClient {
   // ==========================================================================
 
   /** Get the currently booked slot */
-  async getCurrentSlot(postcode?: string): Promise<CurrentSlot | null> {
+  async getCurrentSlot(postcode?: string, orderId?: string): Promise<CurrentSlot | null> {
     const result = await this.graphql<{ data: { currentSlot: CurrentSlot | null } }>(
       QUERIES.CurrentSlot,
-      { input: { postcode, customerOrderId: this.customerOrderId } }
+      { input: { postcode, customerOrderId: orderId || await this.currentOrderId() } }
     );
     return result.data.currentSlot;
   }
@@ -966,6 +987,7 @@ export class WaitroseClient {
 
   /** Get available slots for specific days */
   async getSlotDays(slotType: SlotType, fromDate: string, branchId?: string, addressId?: string): Promise<SlotDay[]> {
+    const customerOrderId = await this.currentOrderId();
     const result = await this.graphql<{ 
       data: { 
         slotDays: { 
@@ -977,7 +999,7 @@ export class WaitroseClient {
       slotDaysInput: {
         slotType,
         branchId: branchId || this.defaultBranchId,
-        customerOrderId: this.customerOrderId,
+        customerOrderId,
         addressId,
         fromDate,
       },

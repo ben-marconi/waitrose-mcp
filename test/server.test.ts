@@ -19,6 +19,7 @@ function env(t: TestContext, overrides: Record<string, string | undefined> = {})
     ALLOW_INSECURE_NO_AUTH: undefined,
     WAITROSE_ENABLE_WRITES: undefined,
     WAITROSE_ENABLE_SLOT_BOOKING: undefined,
+    WAITROSE_ENABLE_CHECKOUT: undefined,
     WAITROSE_EMAIL: waitroseEmail,
     WAITROSE_PASSWORD: "fixture-password",
     ...overrides,
@@ -62,7 +63,7 @@ async function connect(t: TestContext, url: URL, headers: HeadersInit = authHead
 }
 
 type UpstreamCall = { operation: string; variables: Record<string, unknown> };
-type Reply = (call: UpstreamCall) => Response | object;
+type Reply = (call: UpstreamCall) => object | Promise<object>;
 
 function mockWaitrose(reply: Reply) {
   const calls: UpstreamCall[] = [];
@@ -71,15 +72,19 @@ function mockWaitrose(reply: Reply) {
     assert.equal(url.origin, "https://www.waitrose.com");
     assert.equal(init?.method, "POST");
     const body = JSON.parse(String(init?.body));
-    const operation = url.pathname.includes("/graphql-prod/")
-      ? /^(?:query|mutation) (\w+)/.exec(body.query)?.[1]
-      : url.pathname.includes("/productcontent/search/") ? "Search" : undefined;
+    let operation: string | undefined;
+    if (url.pathname.includes("/graphql-prod/")) operation = /^(?:query|mutation) (\w+)/.exec(body.query)?.[1];
+    if (url.pathname.includes("/productcontent/search/")) operation = "Search";
+    if (url.pathname === "/api/order-orchestration-prod/v1/orders/order-1/place") {
+      operation = "PlaceOrder";
+      assert.equal(init?.redirect, "manual");
+    }
     assert.ok(operation, `Unexpected upstream request: ${url.pathname}`);
     assert.equal(new Headers(init?.headers).get("Authorization"),
       operation === "NewSession" ? null : "Bearer fixture-access");
     const call = { operation, variables: body.variables ?? body };
     calls.push(call);
-    const response = reply(call);
+    const response = await reply(call);
     return response instanceof Response ? response : Response.json(response);
   };
   return calls;
@@ -130,6 +135,7 @@ function payload(result: Awaited<ReturnType<typeof call>>) {
 
 const readTools = [
   "waitrose_browse",
+  "waitrose_get_checkout",
   "waitrose_get_current_slot",
   "waitrose_get_order",
   "waitrose_get_trolley",
@@ -140,7 +146,7 @@ const readTools = [
 ];
 
 test("MCP initializes and exposes only read tools by default, without a Waitrose login", async (t) => {
-  env(t, { WAITROSE_ENABLE_SLOT_BOOKING: "true" });
+  env(t, { WAITROSE_ENABLE_SLOT_BOOKING: "true", WAITROSE_ENABLE_CHECKOUT: "true" });
   const calls = mockWaitrose(() => assert.fail("Read-only discovery must not contact Waitrose"));
   const client = await connect(t, await endpoint(t));
   assert.equal(client.getServerVersion()?.name, "waitrose");
@@ -152,6 +158,7 @@ test("MCP initializes and exposes only read tools by default, without a Waitrose
   }
   assert.equal((await call(client, "waitrose_add_to_trolley", { lineNumber: "088903", quantity: 1 })).isError, true);
   assert.equal((await call(client, "waitrose_book_slot", { slotId: "slot-1", slotType: "DELIVERY" })).isError, true);
+  assert.equal((await call(client, "waitrose_place_order")).isError, true);
   assert.equal(calls.length, 0);
 });
 
@@ -159,7 +166,7 @@ test("HTTP requires the bearer token at /mcp even if the local bypass flag is se
   env(t, { ALLOW_INSECURE_NO_AUTH: "1" });
   const url = await endpoint(t);
   const health = await nativeFetch(new URL("/health", url));
-  assert.deepEqual(await health.json(), { ok: true, writes: false, slotBooking: false });
+  assert.deepEqual(await health.json(), { ok: true, writes: false, slotBooking: false, checkout: false });
   for (const headers of [{}, { Authorization: "Bearer wrong" }]) {
     const response = await nativeFetch(url, { method: "POST", headers, body: "{}" });
     assert.equal(response.status, 401);
@@ -269,7 +276,7 @@ test("a Waitrose trolley rejection is a tool error, never a successful add", asy
   assert.doesNotMatch(JSON.stringify(result), /private upstream detail|added/);
 });
 
-test("when both gates are enabled, MCP can list and book a mocked slot but never exposes checkout", async (t) => {
+test("slot booking and order placement have separate gates", async (t) => {
   env(t, { WAITROSE_ENABLE_WRITES: "true", WAITROSE_ENABLE_SLOT_BOOKING: "true" });
   const slot = { id: "slot-1", deliveryCharge: { amount: 3, currencyCode: "GBP" } };
   const days = [{ date: "2026-11-20", slots: [slot] }];
@@ -328,4 +335,185 @@ test("login errors do not disclose upstream responses or credentials, and a late
   assert.doesNotMatch(JSON.stringify(result), /fixture-password|upstream echoed/);
   assert.deepEqual(payload(await call(client, "waitrose_search", { query: "milk" })), { totalMatches: 0, products: [] });
   assert.deepEqual(calls.map(({ operation }) => operation), ["NewSession", "NewSession", "Search"]);
+});
+
+const checkoutFlags = { WAITROSE_ENABLE_WRITES: "true", WAITROSE_ENABLE_CHECKOUT: "true" };
+const expectedTotal = { amount: 60.5, currencyCode: "GBP" };
+const fixtures = {
+  customerOrderId: "order-1",
+  totals: { estimated: { total: expectedTotal }, actual: null },
+  slots: [],
+};
+
+function checkoutFixture() {
+  const cart = trolley(2);
+  const context = { customerOrderId: "order-1", defaultBranchId: "branch-1" };
+  const order = {
+    ...cart,
+    instantCheckout: "ALLOWED",
+    checkoutReadiness: { slotTypeValid: true },
+    products: [{ lineNumber: "088903", name: "Milk" }],
+    trolley: {
+      ...cart.trolley,
+      trolleyItems: cart.trolley.trolleyItems.map((item) => ({ ...item, trolleyItemId: 1 })),
+      trolleyTotals: { totalEstimatedCost: { ...expectedTotal }, minimumSpendThresholdMet: true, trolleyItemCounts: { hardConflicts: 0 } },
+    },
+  };
+  const slot = {
+    slotType: "DELIVERY",
+    addressId: "address-1",
+    postcode: "AB1 2CD",
+    startDateTime: "2099-01-01T12:00:00Z",
+    endDateTime: "2099-01-01T13:00:00Z",
+    expiryDateTime: "2099-01-01T00:00:00Z",
+    deliveryCharge: { amount: 3, currencyCode: "GBP" },
+  };
+  function reply(entry: UpstreamCall) {
+    switch (entry.operation) {
+      case "GetShoppingContext":
+        return { data: { shoppingContext: context } };
+      case "GetTrolley":
+        assert.equal(entry.variables.orderId, context.customerOrderId);
+        return { data: { getTrolley: order } };
+      case "CurrentSlot":
+        assert.deepEqual(entry.variables.input, { customerOrderId: context.customerOrderId });
+        return { data: { currentSlot: slot } };
+      default:
+        return loginReply(entry);
+    }
+  }
+  return { context, order, slot, reply };
+}
+
+test("checkout review works in read-only mode and reports blockers when placement is enabled", async (t) => {
+  env(t);
+  const { order, reply } = checkoutFixture();
+  const calls = mockWaitrose(reply);
+  const client = await connect(t, await endpoint(t));
+
+  const preview = payload(await call(client, "waitrose_get_checkout"));
+  assert.equal(preview.placementEnabled, false);
+  assert.equal(preview.reviewId, null);
+  assert.equal(preview.canPlaceOrder, true);
+  assert.deepEqual(preview.estimatedTotal, expectedTotal);
+  assert.equal(preview.items[0].name, "Milk");
+  assert.equal(preview.slot.type, "DELIVERY");
+
+  Object.assign(process.env, checkoutFlags);
+  order.instantCheckout = "NOT_ALLOWED";
+  const blocked = payload(await call(client, "waitrose_get_checkout"));
+  assert.equal(blocked.placementEnabled, true);
+  assert.equal(blocked.canPlaceOrder, false);
+  assert.equal(blocked.reviewId, null);
+  assert.match(blocked.blockers.join(" "), /NOT_ALLOWED/);
+  assert.equal(calls.some(({ operation }) => operation === "PlaceOrder"), false);
+});
+
+test("placement requires a fresh review and sends one POST for the confirmed order", async (t) => {
+  env(t, checkoutFlags);
+  const { context, order, reply } = checkoutFixture();
+  const calls = mockWaitrose((entry) => {
+    if (entry.operation !== "PlaceOrder") return reply(entry);
+    assert.deepEqual(entry.variables, { instantCheckout: true, event: "PLACE" });
+    return fixtures;
+  });
+  const client = await connect(t, await endpoint(t));
+  const { tools } = await client.listTools();
+  const tool = tools.find(({ name }) => name === "waitrose_place_order");
+  assert.equal(tool?.annotations?.readOnlyHint, false);
+  assert.equal(tool?.annotations?.destructiveHint, true);
+  assert.equal(tools.some(({ name }) => name === "waitrose_book_slot"), false);
+  const invalid = await call(client, "waitrose_place_order", { reviewId: "21ed9354-75ae-44d1-8bf5-02e62ac4aa24" });
+  assert.equal(invalid.isError, true);
+
+  const { reviewId } = payload(await call(client, "waitrose_get_checkout"));
+  assert.equal(typeof reviewId, "string");
+  assert.deepEqual(payload(await call(client, "waitrose_place_order", { reviewId })), { placed: fixtures });
+  assert.equal((await call(client, "waitrose_place_order", { reviewId })).isError, true);
+  const after = payload(await call(client, "waitrose_get_checkout"));
+  assert.equal(after.reviewId, null);
+  assert.match(after.blockers.join(" "), /already attempted/);
+
+  context.customerOrderId = "order-2";
+  order.trolley.orderId = "order-2";
+  assert.equal(payload(await call(client, "waitrose_get_trolley")).trolley.orderId, "order-2");
+  assert.equal(calls.filter(({ operation }) => operation === "PlaceOrder").length, 1);
+});
+
+test("a changed order, total, item quantity or slot prevents placement", async (t) => {
+  env(t, checkoutFlags);
+  const { context, order, slot, reply } = checkoutFixture();
+  const calls = mockWaitrose(reply);
+  const client = await connect(t, await endpoint(t));
+
+  const changes = [
+    () => { context.customerOrderId = "order-2"; order.trolley.orderId = "order-2"; },
+    () => { order.trolley.trolleyTotals.totalEstimatedCost.amount += 1; },
+    () => { order.trolley.trolleyItems[0].quantity.amount += 1; },
+    () => { slot.addressId = "address-2"; },
+  ];
+  for (const change of changes) {
+    const { reviewId } = payload(await call(client, "waitrose_get_checkout"));
+    assert.equal(typeof reviewId, "string");
+    change();
+    const result = await call(client, "waitrose_place_order", { reviewId });
+    assert.equal(result.isError, true);
+    assert.match(JSON.stringify(result), /changed/);
+    assert.equal((await call(client, "waitrose_place_order", { reviewId })).isError, true);
+  }
+  assert.equal(calls.some(({ operation }) => operation === "PlaceOrder"), false);
+});
+
+test("an expired checkout review cannot be submitted", async (t) => {
+  env(t, checkoutFlags);
+  const { reply } = checkoutFixture();
+  const calls = mockWaitrose(reply);
+  const client = await connect(t, await endpoint(t));
+  const now = Date.now();
+  const clock = t.mock.method(Date, "now", () => now);
+  const { reviewId } = payload(await call(client, "waitrose_get_checkout"));
+  clock.mock.mockImplementation(() => now + 5 * 60_000);
+  const result = await call(client, "waitrose_place_order", { reviewId });
+  assert.equal(result.isError, true);
+  assert.match(JSON.stringify(result), /expired/);
+  assert.equal(calls.some(({ operation }) => operation === "PlaceOrder"), false);
+});
+
+test("a write cannot race with placement, and an uncertain response blocks another attempt", async (t) => {
+  env(t, checkoutFlags);
+  const { reply } = checkoutFixture();
+  let signalStarted: () => void;
+  let finishPlacement: (response: Response) => void;
+  const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+  const finish = new Promise<Response>((resolve) => { finishPlacement = resolve; });
+  const calls = mockWaitrose((entry) => {
+    if (entry.operation !== "PlaceOrder") return reply(entry);
+    signalStarted();
+    return finish;
+  });
+  const url = await endpoint(t);
+  const client = await connect(t, url);
+  const secondClient = await connect(t, url);
+  const { reviewId } = payload(await call(client, "waitrose_get_checkout"));
+  const placement = call(client, "waitrose_place_order", { reviewId });
+  try {
+    await Promise.race([
+      started,
+      placement.then((result) => assert.fail(JSON.stringify(result))),
+    ]);
+    const update = await call(secondClient, "waitrose_add_to_trolley", { lineNumber: "088903", quantity: 1 });
+    assert.equal(update.isError, true);
+    assert.match(JSON.stringify(update), /in progress/);
+  } finally {
+    finishPlacement(new Response("private upstream response", { status: 503 }));
+  }
+  const failed = await placement;
+  assert.equal(failed.isError, true);
+  assert.match(JSON.stringify(failed), /may already have placed order order-1/);
+  assert.doesNotMatch(JSON.stringify(failed), /private upstream response/);
+  const after = payload(await call(client, "waitrose_get_checkout"));
+  assert.equal(after.reviewId, null);
+  assert.equal((await call(client, "waitrose_place_order", { reviewId })).isError, true);
+  assert.equal(calls.filter(({ operation }) => operation === "PlaceOrder").length, 1);
+  assert.equal(calls.some(({ operation }) => operation === "UpdateTrolleyItems"), false);
 });

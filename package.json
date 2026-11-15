@@ -3,7 +3,7 @@
   "version": "0.2.2",
   "private": true,
   "type": "module",
-  "description": "Self-hosted, unofficial Waitrose MCP server for personal use. Search, trolley and slots. No checkout.",
+  "description": "Unofficial, self-hosted Waitrose MCP server for search, trolley, slots and checkout.",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/src/server.js",
